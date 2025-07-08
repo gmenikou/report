@@ -1,77 +1,92 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer
-import speech_recognition as sr
-import numpy as np
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
 import av
-import threading
+import queue
+import numpy as np
+from faster_whisper import WhisperModel
 
-st.title("Real-Time Greek Voice Command Transcriber")
+# Load Whisper with Greek language
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
-if "transcript" not in st.session_state:
-    st.session_state.transcript = ""
+# Audio queue for streaming
+audio_queue = queue.Queue()
 
-recognizer = sr.Recognizer()
+# Transcription buffer
+transcript = ""
+capitalize_next = True  # Track sentence beginnings
 
-# This class processes the audio frames
-class AudioProcessor:
-    def __init__(self):
-        self.audio_buffer = bytes()
-        self.lock = threading.Lock()
+def process_commands(text):
+    global capitalize_next
 
-    def recv(self, frame: av.AudioFrame):
-        # Convert frame to numpy array, then to bytes
-        audio = frame.to_ndarray(format="s16").tobytes()
+    text = text.strip().lower()
 
-        # Accumulate audio in buffer
-        with self.lock:
-            self.audio_buffer += audio
+    if "next" in text:
+        return "\n\n", True
+    elif "stop" in text:
+        return ". ", True
+    else:
+        if capitalize_next:
+            text = text[:1].upper() + text[1:]
+            capitalize_next = False
+        return text + " ", False
 
-        # Process buffer every ~2 seconds (adjust as needed)
-        if len(self.audio_buffer) > 32000 * 2 * 2:  # 32000 Hz, 2 bytes per sample, 2 sec
-            with self.lock:
-                audio_data = self.audio_buffer
-                self.audio_buffer = bytes()
+def speech_worker():
+    global transcript, capitalize_next
+    buffer = []
 
-            # Use speech_recognition on the chunk in a thread to avoid blocking
-            threading.Thread(target=process_audio, args=(audio_data,)).start()
+    while True:
+        audio_frame = audio_queue.get()
+        if audio_frame is None:
+            break
 
-        return frame
+        pcm = audio_frame.to_ndarray().flatten().astype(np.float32) / 32768.0
+        buffer.extend(pcm.tolist())
 
-def process_audio(audio_bytes):
-    try:
-        audio_data = sr.AudioData(audio_bytes, sample_rate=32000, sample_width=2)
-        text = recognizer.recognize_google(audio_data, language="el-GR").strip().lower()
-        
-        # Voice commands
-        if text == "stop":
-            lines = st.session_state.transcript.strip().split("\n")
-            if lines and lines[-1]:
-                line = lines[-1].strip()
-                line = line[0].upper() + line[1:]
-                if not line.endswith("."):
-                    line += "."
-                lines[-1] = line
-                st.session_state.transcript = "\n".join(lines) + "\n"
-            else:
-                st.session_state.transcript += "\n"
-        elif text == "next":
-            st.session_state.transcript += "\n\n"
-        else:
-            st.session_state.transcript += text + " "
-        
-        # Force rerun to update UI
-        st.experimental_rerun()
-    except sr.UnknownValueError:
-        pass  # ignore unrecognized audio
-    except Exception as e:
-        st.error(f"Error: {e}")
+        # Process every ~3 seconds of audio
+        if len(buffer) > 48000 * 3:
+            segments, _ = model.transcribe(np.array(buffer), language="el", beam_size=5)
 
-webrtc_streamer(
+            for segment in segments:
+                raw_text = segment.text.strip()
+                processed, is_command = process_commands(raw_text)
+
+                transcript += processed
+                if is_command:
+                    capitalize_next = True
+
+            buffer.clear()
+
+def audio_callback(frame: av.AudioFrame):
+    audio_queue.put(frame)
+    return frame
+
+# UI
+st.title("🎤 Greek Real-Time Voice Transcription")
+st.markdown("Say **'stop'** to add a period. Say **'next'** for new paragraph.")
+
+# Start WebRTC
+ctx = webrtc_streamer(
     key="audio-transcription",
-    mode="sendrecv",
-    audio_processor_factory=AudioProcessor,
-    media_stream_constraints={"audio": True, "video": False},
+    mode=WebRtcMode.SENDRECV,
+    client_settings=ClientSettings(
+        media_stream_constraints={"audio": True, "video": False},
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    ),
+    audio_receiver_size=1024,
+    audio_frame_callback=audio_callback,
     async_processing=True,
 )
 
-st.text_area("Transcript", value=st.session_state.transcript, height=300)
+# Start transcribing in background
+if ctx.state.playing:
+    st.info("Listening... Speak Greek clearly into your USB mic.")
+    threading = st.session_state.get("threading")
+
+    if not threading:
+        import threading as th
+        t = th.Thread(target=speech_worker, daemon=True)
+        t.start()
+        st.session_state["threading"] = True
+
+# Output
+st.text_area("📄 Transcript", transcript, height=300)
