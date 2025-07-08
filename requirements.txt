@@ -1,6 +1,7 @@
 streamlit
 streamlit-webrtc
 whisper
+torch
 numpy
 av
-soundfile
+ffmpeg-python
