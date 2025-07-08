@@ -1,92 +1,55 @@
 import streamlit as st
+import whisper
+import tempfile
+import os
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
 import av
-import queue
-import numpy as np
-from faster_whisper import WhisperModel
 
-# Load Whisper with Greek language
-model = WhisperModel("small", device="cpu", compute_type="int8")
+# Load a smaller Whisper model due to memory limits on Streamlit Cloud
+model = whisper.load_model("small")  # use "large" locally only
 
-# Audio queue for streaming
-audio_queue = queue.Queue()
+st.title("🎙️ Greek Voice Transcriber with Whisper")
 
-# Transcription buffer
-transcript = ""
-capitalize_next = True  # Track sentence beginnings
+st.markdown("This transcribes your speech using OpenAI's Whisper model. Say 'stop' or 'next' for commands.")
 
-def process_commands(text):
-    global capitalize_next
+# Setup audio receiver
+class AudioProcessor:
+    def __init__(self):
+        self.audio_buffer = b""
 
-    text = text.strip().lower()
+    def recv(self, frame: av.AudioFrame):
+        self.audio_buffer += frame.to_ndarray().tobytes()
+        return av.AudioFrame.from_ndarray(frame.to_ndarray(), layout=frame.layout.name)
 
-    if "next" in text:
-        return "\n\n", True
-    elif "stop" in text:
-        return ". ", True
-    else:
-        if capitalize_next:
-            text = text[:1].upper() + text[1:]
-            capitalize_next = False
-        return text + " ", False
+audio_processor = AudioProcessor()
 
-def speech_worker():
-    global transcript, capitalize_next
-    buffer = []
-
-    while True:
-        audio_frame = audio_queue.get()
-        if audio_frame is None:
-            break
-
-        pcm = audio_frame.to_ndarray().flatten().astype(np.float32) / 32768.0
-        buffer.extend(pcm.tolist())
-
-        # Process every ~3 seconds of audio
-        if len(buffer) > 48000 * 3:
-            segments, _ = model.transcribe(np.array(buffer), language="el", beam_size=5)
-
-            for segment in segments:
-                raw_text = segment.text.strip()
-                processed, is_command = process_commands(raw_text)
-
-                transcript += processed
-                if is_command:
-                    capitalize_next = True
-
-            buffer.clear()
-
-def audio_callback(frame: av.AudioFrame):
-    audio_queue.put(frame)
-    return frame
-
-# UI
-st.title("🎤 Greek Real-Time Voice Transcription")
-st.markdown("Say **'stop'** to add a period. Say **'next'** for new paragraph.")
-
-# Start WebRTC
-ctx = webrtc_streamer(
+webrtc_streamer(
     key="audio-transcription",
-    mode=WebRtcMode.SENDRECV,
+    mode=WebRtcMode.SENDONLY,
     client_settings=ClientSettings(
         media_stream_constraints={"audio": True, "video": False},
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
     ),
-    audio_receiver_size=1024,
-    audio_frame_callback=audio_callback,
-    async_processing=True,
+    audio_receiver_factory=lambda: audio_processor,
 )
 
-# Start transcribing in background
-if ctx.state.playing:
-    st.info("Listening... Speak Greek clearly into your USB mic.")
-    threading = st.session_state.get("threading")
+if st.button("🔊 Transcribe Audio"):
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+        tmpfile.write(audio_processor.audio_buffer)
+        tmpfile_path = tmpfile.name
 
-    if not threading:
-        import threading as th
-        t = th.Thread(target=speech_worker, daemon=True)
-        t.start()
-        st.session_state["threading"] = True
+    # Transcribe using whisper
+    result = model.transcribe(tmpfile_path, language="el")  # 'el' for Greek
+    text = result["text"]
 
-# Output
-st.text_area("📄 Transcript", transcript, height=300)
+    # Handle voice commands
+    text = text.strip()
+    if "stop" in text.lower():
+        text = text.replace("stop", "").strip().capitalize() + "."
+    if "next" in text.lower():
+        text = text.replace("next", "").strip() + "\n\n"
+
+    st.success("Transcription:")
+    st.write(text)
+
+    os.remove(tmpfile_path)
