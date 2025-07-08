@@ -1,6 +1,5 @@
+openai-whisper
+torch
+torchaudio
 streamlit
-streamlit-webrtc
-speechrecognition
-av
-numpy
 streamlit-webrtc
