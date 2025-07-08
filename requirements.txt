@@ -3,3 +3,4 @@ streamlit-webrtc
 speechrecognition
 av
 numpy
+streamlit-webrtc
