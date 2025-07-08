@@ -1,6 +1,6 @@
-openai-whisper
-torch
-torchaudio
 streamlit
-streamlit-webrtc>=0.45.0
-
+streamlit-webrtc
+whisper
+numpy
+av
+soundfile
