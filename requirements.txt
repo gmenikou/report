@@ -1,7 +1,5 @@
 streamlit
-streamlit-webrtc
-whisper
+openai-whisper
+ffmpeg-python
 torch
 numpy
-av
-ffmpeg-python
