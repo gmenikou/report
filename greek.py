@@ -12,7 +12,7 @@ st.title("Streamlit Whisper Greek Transcriber with Voice Commands")
 # Load Whisper model once (use smaller model for faster performance)
 @st.cache_resource(show_spinner=True)
 def load_model():
-    return whisper.load_model("base")  # you can switch to "large" if resources allow
+    return whisper.load_model("small")  # you can switch to "large" if resources allow
 
 model = load_model()
 
