@@ -1,112 +1,102 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import whisper
+import sounddevice as sd
 import numpy as np
-import av
-import tempfile
-import re
+import queue
+import threading
 
-# Load Whisper model once (cached for performance)
-@st.cache_resource
+st.title("Live Whisper Transcription with Voice Commands")
+
+# Load model once (not cached)
+@st.cache_resource(show_spinner=False)
 def load_model():
-    return whisper.load_model("large")
+    return whisper.load_model("base")  # use "small" or "tiny" for faster
 
 model = load_model()
 
-st.title("Live Whisper Large Transcription with Voice Commands")
+# Audio recording params
+samplerate = 16000  # Whisper needs 16kHz audio
+channels = 1
+blocksize = 1024
 
-# Store transcript state
+audio_q = queue.Queue()
+
+# Buffer to hold audio chunks
+audio_buffer = []
+
+def audio_callback(indata, frames, time, status):
+    if status:
+        print(status)
+    audio_q.put(indata.copy())
+
+# Start recording stream in a background thread
+def start_recording():
+    stream = sd.InputStream(
+        samplerate=samplerate,
+        channels=channels,
+        callback=audio_callback,
+        blocksize=blocksize,
+    )
+    stream.start()
+    return stream
+
+# Start stream globally once
+if "stream" not in st.session_state:
+    st.session_state.stream = start_recording()
+
+# Text area for transcription output
 if "transcript" not in st.session_state:
     st.session_state.transcript = ""
 
-def process_commands(text):
-    """
-    Detect voice commands and apply formatting:
-    - "stop": capitalize first letter and add period if not present
-    - "next": insert paragraph break (two newlines)
-    Return cleaned text and updated transcript string.
-    """
-    words = text.strip().lower().split()
+st.text_area("Transcription", value=st.session_state.transcript, height=300, key="transcript_area")
 
-    if not words:
-        return "", ""
+# Processing thread function
+def process_audio():
+    while True:
+        try:
+            data = audio_q.get(timeout=1)
+            audio_buffer.append(data.flatten())
+            
+            # Process every ~2 seconds of audio
+            if len(audio_buffer)*blocksize >= samplerate*2:
+                audio_np = np.concatenate(audio_buffer)
+                audio_buffer.clear()
+                
+                # Whisper expects float32 np array normalized between -1 and 1
+                audio_float = audio_np.astype(np.float32)
+                audio_float = audio_float / np.max(np.abs(audio_float))
+                
+                # Transcribe
+                result = model.transcribe(audio_float, language="el", fp16=False)
+                text = result["text"].strip()
+                if not text:
+                    continue
+                
+                # Handle voice commands
+                text_lower = text.lower()
+                if "stop" in text_lower:
+                    # Capitalize first letter and add period
+                    if st.session_state.transcript:
+                        st.session_state.transcript = st.session_state.transcript.rstrip() + ". "
+                    # Capitalize next word (simulate new sentence)
+                    text = text_lower.replace("stop", "").strip().capitalize()
+                elif "next" in text_lower:
+                    # Insert new paragraph
+                    st.session_state.transcript += "\n\n"
+                    text = text_lower.replace("next", "").strip()
+                
+                # Append recognized text
+                if text:
+                    if st.session_state.transcript and not st.session_state.transcript.endswith(("\n", " ")):
+                        st.session_state.transcript += " "
+                    st.session_state.transcript += text
+                
+                # Update text area in main thread
+                st.experimental_rerun()
+        except queue.Empty:
+            continue
 
-    # Commands only if single word or last word
-    last_word = words[-1]
-
-    if last_word == "stop":
-        # Remove "stop" from transcription
-        text = text.rsplit(" ", 1)[0].strip()
-
-        # Capitalize first letter of last sentence and add period if missing
-        if st.session_state.transcript:
-            # Capitalize first letter of last sentence in transcript if needed
-            sentences = re.split(r'([.!?])', st.session_state.transcript.strip())
-            if sentences:
-                # Combine last sentence with punctuation
-                last_sentence = "".join(sentences[-2:]).strip()
-                # Capitalize first char
-                last_sentence = last_sentence.capitalize()
-                if not last_sentence.endswith('.'):
-                    last_sentence += '.'
-                # Replace last sentence in transcript
-                st.session_state.transcript = "".join(sentences[:-2]) + last_sentence + " "
-
-        return "", ""  # Don't add the command word itself to transcript
-
-    elif last_word == "next":
-        # Remove "next" from transcription
-        text = text.rsplit(" ", 1)[0].strip()
-
-        # Insert paragraph break
-        st.session_state.transcript += "\n\n"
-
-        return "", ""  # Don't add "next" to transcript
-
-    else:
-        return text, text + " "
-
-def audio_frame_callback(frame: av.AudioFrame):
-    # Convert audio frame to numpy array
-    audio = frame.to_ndarray(format="flt32", layout="mono")
-
-    # Resample from 48000 to 16000 Hz (Whisper requirement)
-    audio_16k = whisper.audio.resample(audio.flatten(), 48000, 16000)
-
-    # Save temp wav file to transcribe
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        import soundfile as sf
-        sf.write(tmp.name, audio_16k, 16000)
-
-        # Run Whisper transcription with Greek language (change if needed)
-        result = model.transcribe(tmp.name, language="el")
-        text = result["text"].strip()
-
-    if text:
-        cleaned_text, appended_text = process_commands(text)
-        if appended_text:
-            st.session_state.transcript += appended_text
-
-    # Update transcript display in Streamlit (async-safe)
-    st.session_state.transcript = st.session_state.transcript.strip()
-    st.session_state.transcript_display = st.session_state.transcript.replace("\n", "\n")
-
-    return av.AudioFrame.from_ndarray(audio, layout="mono")
-
-# UI
-st.text_area(
-    "Transcription",
-    value=st.session_state.get("transcript_display", ""),
-    height=300,
-    key="text_area",
-    label_visibility="visible"
-)
-
-# Start WebRTC streamer for audio input, no video
-webrtc_streamer(
-    key="whisper-large-voicecmd",
-    mode=WebRtcMode.SENDRECV,
-    audio_frame_callback=audio_frame_callback,
-    media_stream_constraints={"audio": True, "video": False},
-    async_processing=True,
-)
+if "thread" not in st.session_state:
+    thread = threading.Thread(target=process_audio, daemon=True)
+    thread.start()
+    st.session_state.thread = thread
